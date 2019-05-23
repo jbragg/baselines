@@ -314,7 +314,7 @@ def build_act_with_param_noise(make_obs_ph, q_func, num_actions, scope="deepq", 
         return act
 
 
-def build_train(make_obs_ph, q_func, num_actions, optimizer, grad_norm_clipping=None, gamma=1.0,
+def build_train(make_obs_ph, q_func, num_actions, optimizer, optimizer_mc, grad_norm_clipping=None, gamma=1.0,
     double_q=True, scope="deepq", reuse=None, param_noise=False, param_noise_filter_func=None):
     """Creates the train function:
 
@@ -338,6 +338,8 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, grad_norm_clipping=
         whether or not to reuse the graph variables
     optimizer: tf.train.Optimizer
         optimizer to use for the Q-learning objective.
+    optimizer_mc: tf.train.Optimizer
+        optimizer to use for the Q-learning objective when using monte-carlo estimates.
     grad_norm_clipping: float or None
         clip gradient norms to this value. If None no clipping is performed.
     gamma: float
@@ -380,6 +382,7 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, grad_norm_clipping=
         obs_t_input = make_obs_ph("obs_t")
         act_t_ph = tf.placeholder(tf.int32, [None], name="action")
         rew_t_ph = tf.placeholder(tf.float32, [None], name="reward")
+        q_t_ph = tf.placeholder(tf.float32, [None], name="reward_to_go")
         obs_tp1_input = make_obs_ph("obs_tp1")
         done_mask_ph = tf.placeholder(tf.float32, [None], name="done")
         importance_weights_ph = tf.placeholder(tf.float32, [None], name="weight")
@@ -409,8 +412,11 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, grad_norm_clipping=
 
         # compute the error (potentially clipped)
         td_error = q_t_selected - tf.stop_gradient(q_t_selected_target)
+        td_error_mc = q_t_selected - q_t_ph
         errors = U.huber_loss(td_error)
+        errors_mc = U.huber_loss(td_error_mc)
         weighted_error = tf.reduce_mean(importance_weights_ph * errors)
+        weighted_error_mc = tf.reduce_mean(importance_weights_ph * errors_mc)
 
         # compute optimization op (potentially with gradient clipping)
         if grad_norm_clipping is not None:
@@ -419,8 +425,15 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, grad_norm_clipping=
                 if grad is not None:
                     gradients[i] = (tf.clip_by_norm(grad, grad_norm_clipping), var)
             optimize_expr = optimizer.apply_gradients(gradients)
+            # Same thing for _mc version.
+            gradients_mc = optimizer_mc.compute_gradients(weighted_error_mc, var_list=q_func_vars)
+            for i, (grad, var) in enumerate(gradients_mc):
+                if grad is not None:
+                    gradients_mc[i] = (tf.clip_by_norm(grad, grad_norm_clipping), var)
+            optimize_expr_mc = optimizer_mc.apply_gradients(gradients_mc)
         else:
             optimize_expr = optimizer.minimize(weighted_error, var_list=q_func_vars)
+            optimize_expr_mc = optimizer_mc.minimize(weighted_error_mc, var_list=q_func_vars)
 
         # update_target_fn will be called periodically to copy Q network to target Q network
         update_target_expr = []
@@ -442,8 +455,19 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, grad_norm_clipping=
             outputs=td_error,
             updates=[optimize_expr]
         )
+        # Monte-carlo rollout version. Only works for on-policy data.
+        train_mc = U.function(
+            inputs=[
+                obs_t_input,
+                act_t_ph,
+                q_t_ph,
+                importance_weights_ph
+            ],
+            outputs=td_error_mc,
+            updates=[optimize_expr_mc]
+        )
         update_target = U.function([], [], updates=[update_target_expr])
 
         q_values = U.function([obs_t_input], q_t)
 
-        return act_f, train, update_target, {'q_values': q_values}
+        return act_f, train, train_mc, update_target, {'q_values': q_values}
